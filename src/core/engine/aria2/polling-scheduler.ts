@@ -12,6 +12,7 @@ const log = getLogger('polling-scheduler')
 
 const ACTIVE_INTERVAL = 1_000
 const IDLE_INTERVAL = 10_000
+const WAITING_PAGE_SIZE = 1_000
 
 // Notifications that indicate a download has started or resumed.
 const START_NOTIFICATIONS = new Set(['aria2.onDownloadStart'])
@@ -227,13 +228,34 @@ export class PollingScheduler {
     const results = await this.rpc.multicall([
       { method: 'aria2.getGlobalStat', params: [] },
       { method: 'aria2.tellActive', params: [TASK_STATUS_FIELDS] },
-      { method: 'aria2.tellWaiting', params: [0, 1000, TASK_STATUS_FIELDS] },
+      {
+        method: 'aria2.tellWaiting',
+        params: [0, WAITING_PAGE_SIZE, TASK_STATUS_FIELDS],
+      },
     ])
     if (this.stopped || epoch !== this.epoch) return
 
     const rawStats = results[0] as import('./types').Aria2RawGlobalStat
     const rawActive = results[1] as Aria2RawStatus[]
     const rawWaiting = results[2] as Aria2RawStatus[]
+
+    // Bound this poll to the queue size observed at its start so arrivals cannot
+    // extend a slow poll indefinitely. Later polls reconcile queue movement.
+    const waitingCount = Number(rawStats.numWaiting)
+    let page = rawWaiting
+    for (
+      let offset = WAITING_PAGE_SIZE;
+      page.length === WAITING_PAGE_SIZE && offset < waitingCount;
+      offset += WAITING_PAGE_SIZE
+    ) {
+      page = await this.rpc.tellWaiting(
+        offset,
+        WAITING_PAGE_SIZE,
+        TASK_STATUS_FIELDS
+      )
+      if (this.stopped || epoch !== this.epoch) return
+      rawWaiting.push(...page)
+    }
 
     // Notifications are advisory: aria2 may already have active work when
     // Motrix subscribes (for example after session restore). Reconcile the
@@ -245,7 +267,14 @@ export class PollingScheduler {
     }
 
     this.onStats(translateGlobalStat(rawStats))
-    const statuses = [...rawActive, ...rawWaiting]
+    // Queue movement between pages may repeat a GID. Keep its active snapshot
+    // when a task also appeared in the earlier active response.
+    const seen = new Set<string>()
+    const statuses = [...rawActive, ...rawWaiting].filter((task) => {
+      if (seen.has(task.gid)) return false
+      seen.add(task.gid)
+      return true
+    })
     this.metadata.retain(new Set(statuses.map((task) => task.gid)))
     // Bound metadata fan-out during restore; ordinary list polls do no file IO.
     const tasks: Aria2TaskStatus[] = []

@@ -22,6 +22,7 @@ function createMockRpc(): Aria2RpcClient {
     getFiles: vi.fn(),
     onTaskMetadataChanged: vi.fn(() => vi.fn()),
     tellStatus: vi.fn(),
+    tellWaiting: vi.fn(),
     multicall: vi.fn(),
   } as unknown as Aria2RpcClient
 }
@@ -180,6 +181,109 @@ describe('PollingScheduler', () => {
     await vi.advanceTimersByTimeAsync(0)
     expect(onTasksUpdate).not.toHaveBeenCalled()
     expect(rpc.getFiles).not.toHaveBeenCalled()
+  })
+
+  it('publishes waiting tasks beyond the first 1000 with compact RPC fields', async () => {
+    const waiting = Array.from({ length: 2501 }, (_, index) => ({
+      ...PAUSED_TASK,
+      gid: `waiting-${index}`,
+    }))
+    vi.mocked(rpc.multicall).mockResolvedValue([
+      { ...IDLE_STAT, numWaiting: '2501' },
+      [],
+      waiting.slice(0, 1000),
+    ])
+    vi.mocked(rpc.tellWaiting)
+      .mockResolvedValueOnce(waiting.slice(1000, 2000))
+      .mockResolvedValueOnce(waiting.slice(2000))
+
+    scheduler.start()
+    await vi.advanceTimersByTimeAsync(0)
+
+    const published = onTasksUpdate.mock.calls[0][0]
+    expect(published).toHaveLength(2501)
+    expect(published.at(-1)?.gid).toBe('waiting-2500')
+    expect(rpc.tellWaiting).toHaveBeenNthCalledWith(
+      1,
+      1000,
+      1000,
+      TASK_STATUS_FIELDS
+    )
+    expect(rpc.tellWaiting).toHaveBeenNthCalledWith(
+      2,
+      2000,
+      1000,
+      TASK_STATUS_FIELDS
+    )
+  })
+
+  it('deduplicates tasks that move between the active list and waiting pages', async () => {
+    const waiting = Array.from({ length: 1000 }, (_, index) => ({
+      ...PAUSED_TASK,
+      gid: `waiting-${index}`,
+    }))
+    vi.mocked(rpc.multicall).mockResolvedValue([
+      { ...ACTIVE_STAT, numWaiting: '1001' },
+      ACTIVE_TASKS,
+      waiting,
+    ])
+    vi.mocked(rpc.tellWaiting).mockResolvedValue([PAUSED_TASK])
+
+    scheduler.start()
+    await vi.advanceTimersByTimeAsync(0)
+
+    const published = onTasksUpdate.mock.calls[0][0]
+    expect(published).toHaveLength(1001)
+    expect(
+      published.find((task: Aria2TaskStatus) => task.gid === 'gid1')?.status
+    ).toBe('active')
+  })
+
+  it('stops paging when a shrinking queue returns a short page', async () => {
+    const waiting = Array.from({ length: 1000 }, (_, index) => ({
+      ...PAUSED_TASK,
+      gid: `waiting-${index}`,
+    }))
+    vi.mocked(rpc.multicall).mockResolvedValue([
+      { ...IDLE_STAT, numWaiting: '5000' },
+      [],
+      waiting,
+    ])
+    vi.mocked(rpc.tellWaiting).mockResolvedValue([])
+
+    scheduler.start()
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(onTasksUpdate.mock.calls[0][0]).toHaveLength(1000)
+    expect(rpc.tellWaiting).toHaveBeenCalledTimes(1)
+  })
+
+  it('drains a stopped paginated poll without publishing a partial snapshot', async () => {
+    const waiting = Array.from({ length: 1000 }, (_, index) => ({
+      ...PAUSED_TASK,
+      gid: `waiting-${index}`,
+    }))
+    vi.mocked(rpc.multicall).mockResolvedValue([
+      { ...IDLE_STAT, numWaiting: '1001' },
+      [],
+      waiting,
+    ])
+    let resolvePage!: (page: Aria2RawStatus[]) => void
+    vi.mocked(rpc.tellWaiting).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolvePage = resolve
+        })
+    )
+
+    scheduler.start()
+    await vi.advanceTimersByTimeAsync(0)
+    const drain = scheduler.stopAndDrain()
+    resolvePage([PAUSED_TASK])
+    await drain
+
+    expect(onStats).not.toHaveBeenCalled()
+    expect(onTasksUpdate).not.toHaveBeenCalled()
   })
 
   describe('start / stop', () => {
